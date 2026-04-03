@@ -15,9 +15,9 @@ static const uint8_t DEBUG_LED_PIN = 13;
 static const unsigned long RTC_POLL_MS = 200UL;
 static const unsigned long PREWARN_BLINK_INTERVAL_MS = 500UL; // 1 Hz (500 ms on / 500 ms off)
 static const unsigned long ERROR_BLINK_INTERVAL_MS = 100UL;   // 5 Hz (100 ms on / 100 ms off)
-static const unsigned long ERROR_SERIAL_INTERVAL_MS = 5000UL;
+static const unsigned long ERROR_SERIAL_INTERVAL_MS = 1000UL;
 static const int PREWARN_SECONDS = 30;
-static const size_t SERIAL_CMD_BUF_LEN = 40;
+static const size_t SERIAL_CMD_BUF_LEN = 80;
 
 // =========================
 // RTC
@@ -100,6 +100,7 @@ LedState currentState = LED_OFF_ALLOWED;
 unsigned long lastRtcPollMs = 0;
 uint8_t lastDebugSecond = 255;
 bool rtcInvalidLatched = false;
+bool rtcTimeValidated = false; // true after explicit successful time set or valid startup state
 unsigned long lastErrorSerialMs = 0;
 char serialCmdBuf[SERIAL_CMD_BUF_LEN];
 size_t serialCmdLen = 0;
@@ -208,6 +209,7 @@ void handleSerialLine(char *line) {
 
   rtc.adjust(DateTime(year, month, day, hour, minute, second));
   rtcInvalidLatched = false;
+  rtcTimeValidated = true;
   currentState = LED_OFF_ALLOWED;
   lastDebugSecond = 255; // force immediate status print
 
@@ -247,6 +249,12 @@ void processSerialCommands() {
 
     if (serialCmdLen < (SERIAL_CMD_BUF_LEN - 1)) {
       serialCmdBuf[serialCmdLen++] = c;
+      // Accept exact SET command length even if monitor sends no line ending.
+      if (serialCmdLen == 23 && strncmp(serialCmdBuf, "SET ", 4) == 0) {
+        serialCmdBuf[serialCmdLen] = '\0';
+        handleSerialLine(serialCmdBuf);
+        serialCmdLen = 0;
+      }
     } else {
       serialCmdLen = 0;
       Serial.println(F("ERROR: command too long"));
@@ -473,6 +481,7 @@ void setup() {
   if (!rtc.begin()) {
     rtcAvailable = false;
     rtcInvalidLatched = true;
+    rtcTimeValidated = false;
     currentState = LED_ERROR_RTC_INVALID;
 #if ENABLE_SERIAL_DEBUG
     Serial.println(F("ERROR: DS3231 not found. RTC invalid."));
@@ -483,6 +492,7 @@ void setup() {
 
 #if SET_RTC_ON_UPLOAD
   rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  rtcTimeValidated = true;
 #if ENABLE_SERIAL_DEBUG
   Serial.println(F("RTC adjusted to compile time."));
 #endif
@@ -490,10 +500,13 @@ void setup() {
 
   if (rtc.lostPower()) {
     rtcInvalidLatched = true;
+    rtcTimeValidated = false;
     currentState = LED_ERROR_RTC_INVALID;
 #if ENABLE_SERIAL_DEBUG
     Serial.println(F("ERROR: RTC lost power, time invalid"));
 #endif
+  } else {
+    rtcTimeValidated = true;
   }
 }
 
@@ -525,7 +538,7 @@ void loop() {
   }
   lastRtcPollMs = nowMs;
 
-  if (rtc.lostPower()) {
+  if (!rtcTimeValidated && rtc.lostPower()) {
     rtcInvalidLatched = true;
   }
 
