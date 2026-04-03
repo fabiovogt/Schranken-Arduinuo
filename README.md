@@ -24,7 +24,7 @@ Die LED zeigt anhand von Uhrzeit, Sommerzeit, Wochenenden und NRW-Feiertagen an,
 
 ## Zeitmodell
 
-Die RTC wird bewusst in lokaler deutscher Zeit betrieben, nicht in UTC. Die Sommerzeit wird im Sketch nach EU-Regel berechnet.
+Die RTC wird intern in UTC betrieben. Der Sketch rechnet daraus automatisch die deutsche Lokalzeit und schaltet Sommer- und Winterzeit nach EU-Regel selbst um.
 
 Erlaubte Zeitfenster:
 
@@ -49,7 +49,7 @@ Im Sketch gibt es drei Schalter:
 
 ## RTC setzen
 
-Bei aktiviertem Serial-Debug kann die Uhr per serieller Konsole gesetzt werden:
+Bei aktiviertem Serial-Debug kann die Uhr per serieller Konsole in deutscher Lokalzeit gesetzt werden:
 
 ```text
 SET YYYY-MM-DD HH:MM:SS
@@ -61,9 +61,15 @@ Beispiel:
 SET 2026-04-03 19:30:00
 ```
 
+Hinweise:
+
+- Der Sketch speichert die RTC intern in UTC.
+- Die Eingabe bleibt trotzdem deutsche Lokalzeit.
+- Nicht existente Zeiten waehrend der Fruehjahrsumstellung und doppeldeutige `02:xx`-Zeiten waehrend der Herbstumstellung werden abgewiesen.
+
 ## Verhalten im Betrieb
 
-Der Sketch pollt die RTC alle 200 ms und aktualisiert die LED blockierungsfrei, damit Blinkmuster sauber bleiben. Wenn die RTC nicht gefunden wird oder `lostPower()` meldet und die Zeit noch nicht neu bestaetigt wurde, geht das System in einen latched Fehlerzustand, bis die Uhr gueltig gesetzt wird.
+Der Sketch pollt die RTC alle 200 ms und aktualisiert die LED blockierungsfrei, damit Blinkmuster sauber bleiben. Wenn die RTC nicht gefunden wird oder `lostPower()` meldet und die Zeit noch nicht neu bestaetigt wurde, geht das System in einen latched Fehlerzustand, bis die Uhr gueltig gesetzt wird. Die Sommer-/Winterzeit wird im laufenden Betrieb automatisch aus der UTC-Zeit abgeleitet.
 
 ## Flashen
 

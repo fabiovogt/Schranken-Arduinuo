@@ -6,7 +6,7 @@
 // Configuration
 // =========================
 #define SET_RTC_ON_UPLOAD 0      // 1 = set RTC to compile time once on upload
-#define ENABLE_SERIAL_DEBUG 1    // 1 = print status once per minute
+#define ENABLE_SERIAL_DEBUG 1    // 1 = print status once per second
 #define USE_DEBUG_LED 1          // 1 = mirror state to onboard LED (D13)
 
 static const uint8_t LED_PIN = 3;
@@ -26,8 +26,12 @@ RTC_DS3231 rtc;
 bool rtcAvailable = false;
 
 // Important design choice:
-// The DS3231 is kept in local Germany time (Europe/Berlin), not UTC.
-// DST is evaluated from this local time using EU rules (last Sunday Mar/Oct).
+// The DS3231 is kept in UTC.
+// Germany local time (Europe/Berlin) is derived from UTC using EU DST rules.
+
+static const uint32_t UNIX_TIME_2000_01_01_00_00_00 = 946684800UL;
+static const uint32_t GERMANY_STD_OFFSET_SECONDS = 3600UL;
+static const uint32_t GERMANY_DST_OFFSET_SECONDS = 7200UL;
 
 // =========================
 // Holidays NRW 2026..2035
@@ -80,6 +84,13 @@ enum LedState : uint8_t {
   LED_ERROR_RTC_INVALID = 3
 };
 
+enum LocalToUtcStatus : uint8_t {
+  LOCAL_TO_UTC_OK = 0,
+  LOCAL_TO_UTC_NONEXISTENT = 1,
+  LOCAL_TO_UTC_AMBIGUOUS = 2,
+  LOCAL_TO_UTC_OUT_OF_RANGE = 3
+};
+
 static const Interval SUMMER_WEEKDAY_INTERVALS[] = {
   {5L * 3600L + 30L * 60L, 13L * 3600L},
   {15L * 3600L, 23L * 3600L}
@@ -104,6 +115,14 @@ bool rtcTimeValidated = false; // true after explicit successful time set or val
 unsigned long lastErrorSerialMs = 0;
 char serialCmdBuf[SERIAL_CMD_BUF_LEN];
 size_t serialCmdLen = 0;
+
+uint8_t lastSundayOfMonth(uint16_t year, uint8_t month);
+bool isSummerTimeEUUtc(const DateTime &utcDateTime);
+bool isNonexistentGermanyLocalTime(const DateTime &localDateTime);
+bool isAmbiguousGermanyLocalTime(const DateTime &localDateTime);
+bool isSummerTimeEULocalUnambiguous(const DateTime &localDateTime);
+DateTime convertUtcToGermanyLocal(const DateTime &utcDateTime, bool &summerOut);
+LocalToUtcStatus convertGermanyLocalToUtc(const DateTime &localDateTime, DateTime &utcDateTime);
 
 // =========================
 // Utility functions
@@ -148,9 +167,30 @@ bool parse4Digits(const char *p, uint16_t &out) {
   return true;
 }
 
+void printDateTime(const DateTime &dt) {
+#if ENABLE_SERIAL_DEBUG
+  Serial.print(dt.year());
+  Serial.print('-');
+  if (dt.month() < 10) Serial.print('0');
+  Serial.print(dt.month());
+  Serial.print('-');
+  if (dt.day() < 10) Serial.print('0');
+  Serial.print(dt.day());
+  Serial.print(' ');
+  if (dt.hour() < 10) Serial.print('0');
+  Serial.print(dt.hour());
+  Serial.print(':');
+  if (dt.minute() < 10) Serial.print('0');
+  Serial.print(dt.minute());
+  Serial.print(':');
+  if (dt.second() < 10) Serial.print('0');
+  Serial.print(dt.second());
+#endif
+}
+
 void printSerialCommandHelp() {
 #if ENABLE_SERIAL_DEBUG
-  Serial.println(F("Serial command: SET YYYY-MM-DD HH:MM:SS"));
+  Serial.println(F("Serial command (Germany local time): SET YYYY-MM-DD HH:MM:SS"));
 #endif
 }
 
@@ -207,30 +247,40 @@ void handleSerialLine(char *line) {
     return;
   }
 
-  rtc.adjust(DateTime(year, month, day, hour, minute, second));
+  const DateTime localDateTime(year, month, day, hour, minute, second);
+  DateTime utcDateTime;
+  const LocalToUtcStatus conversionStatus = convertGermanyLocalToUtc(localDateTime, utcDateTime);
+  if (conversionStatus == LOCAL_TO_UTC_NONEXISTENT) {
+#if ENABLE_SERIAL_DEBUG
+    Serial.println(F("ERROR: This local time does not exist because of the DST change"));
+#endif
+    return;
+  }
+  if (conversionStatus == LOCAL_TO_UTC_AMBIGUOUS) {
+#if ENABLE_SERIAL_DEBUG
+    Serial.println(F("ERROR: This local time is ambiguous because of the DST change"));
+#endif
+    return;
+  }
+  if (conversionStatus == LOCAL_TO_UTC_OUT_OF_RANGE) {
+#if ENABLE_SERIAL_DEBUG
+    Serial.println(F("ERROR: SET datetime converts outside supported RTC range"));
+#endif
+    return;
+  }
+
+  rtc.adjust(utcDateTime);
   rtcInvalidLatched = false;
   rtcTimeValidated = true;
   currentState = LED_OFF_ALLOWED;
   lastDebugSecond = 255; // force immediate status print
 
 #if ENABLE_SERIAL_DEBUG
-  Serial.print(F("OK: RTC set to "));
-  Serial.print(year);
-  Serial.print('-');
-  if (month < 10) Serial.print('0');
-  Serial.print(month);
-  Serial.print('-');
-  if (day < 10) Serial.print('0');
-  Serial.print(day);
-  Serial.print(' ');
-  if (hour < 10) Serial.print('0');
-  Serial.print(hour);
-  Serial.print(':');
-  if (minute < 10) Serial.print('0');
-  Serial.print(minute);
-  Serial.print(':');
-  if (second < 10) Serial.print('0');
-  Serial.println(second);
+  Serial.print(F("OK: RTC set to local "));
+  printDateTime(localDateTime);
+  Serial.print(F(" (stored UTC "));
+  printDateTime(utcDateTime);
+  Serial.println(')');
 #endif
 }
 
@@ -295,7 +345,44 @@ uint8_t lastSundayOfMonth(uint16_t year, uint8_t month) {
   return 31;
 }
 
-bool isSummerTimeEU(const DateTime &localDateTime) {
+bool isSummerTimeEUUtc(const DateTime &utcDateTime) {
+  const uint16_t y = utcDateTime.year();
+  const uint8_t m = utcDateTime.month();
+  const uint8_t d = utcDateTime.day();
+  const uint8_t h = utcDateTime.hour();
+
+  if (m < 3 || m > 10) {
+    return false;
+  }
+  if (m > 3 && m < 10) {
+    return true;
+  }
+
+  if (m == 3) {
+    const uint8_t lastSun = lastSundayOfMonth(y, 3);
+    if (d > lastSun) return true;
+    if (d < lastSun) return false;
+    return (h >= 1); // from 01:00 UTC, summer time applies
+  }
+
+  // m == 10
+  const uint8_t lastSun = lastSundayOfMonth(y, 10);
+  if (d < lastSun) return true;
+  if (d > lastSun) return false;
+  return (h < 1); // until 01:00 UTC, still summer time
+}
+
+bool isNonexistentGermanyLocalTime(const DateTime &localDateTime) {
+  if (localDateTime.month() != 3) return false;
+  return localDateTime.day() == lastSundayOfMonth(localDateTime.year(), 3) && localDateTime.hour() == 2;
+}
+
+bool isAmbiguousGermanyLocalTime(const DateTime &localDateTime) {
+  if (localDateTime.month() != 10) return false;
+  return localDateTime.day() == lastSundayOfMonth(localDateTime.year(), 10) && localDateTime.hour() == 2;
+}
+
+bool isSummerTimeEULocalUnambiguous(const DateTime &localDateTime) {
   const uint16_t y = localDateTime.year();
   const uint8_t m = localDateTime.month();
   const uint8_t d = localDateTime.day();
@@ -312,14 +399,39 @@ bool isSummerTimeEU(const DateTime &localDateTime) {
     const uint8_t lastSun = lastSundayOfMonth(y, 3);
     if (d > lastSun) return true;
     if (d < lastSun) return false;
-    return (h >= 2); // from 02:00 local, summer time applies
+    return (h >= 3); // 02:xx local does not exist on DST start day
   }
 
   // m == 10
   const uint8_t lastSun = lastSundayOfMonth(y, 10);
   if (d < lastSun) return true;
   if (d > lastSun) return false;
-  return (h < 3); // until 03:00 local, still summer time
+  return (h < 2); // 02:xx local is ambiguous on DST end day
+}
+
+DateTime convertUtcToGermanyLocal(const DateTime &utcDateTime, bool &summerOut) {
+  summerOut = isSummerTimeEUUtc(utcDateTime);
+  const uint32_t offsetSeconds = summerOut ? GERMANY_DST_OFFSET_SECONDS : GERMANY_STD_OFFSET_SECONDS;
+  return DateTime(utcDateTime.unixtime() + offsetSeconds);
+}
+
+LocalToUtcStatus convertGermanyLocalToUtc(const DateTime &localDateTime, DateTime &utcDateTime) {
+  if (isNonexistentGermanyLocalTime(localDateTime)) {
+    return LOCAL_TO_UTC_NONEXISTENT;
+  }
+  if (isAmbiguousGermanyLocalTime(localDateTime)) {
+    return LOCAL_TO_UTC_AMBIGUOUS;
+  }
+
+  const bool summer = isSummerTimeEULocalUnambiguous(localDateTime);
+  const uint32_t offsetSeconds = summer ? GERMANY_DST_OFFSET_SECONDS : GERMANY_STD_OFFSET_SECONDS;
+  const uint32_t localUnixTime = localDateTime.unixtime();
+  if (localUnixTime < (UNIX_TIME_2000_01_01_00_00_00 + offsetSeconds)) {
+    return LOCAL_TO_UTC_OUT_OF_RANGE;
+  }
+
+  utcDateTime = DateTime(localUnixTime - offsetSeconds);
+  return LOCAL_TO_UTC_OK;
 }
 
 DayType determineDayType(const DateTime &dt) {
@@ -389,7 +501,7 @@ void updateErrorBlink(unsigned long nowMs) {
   applyLedOutput(on);
 }
 
-void updateStateAndLed(const DateTime &nowLocal, unsigned long nowMs) {
+void updateStateAndLed(const DateTime &nowLocal, bool summer, unsigned long nowMs) {
   // Highest priority: RTC invalid (lost power / invalid time)
   if (rtcInvalidLatched) {
     currentState = LED_ERROR_RTC_INVALID;
@@ -397,7 +509,6 @@ void updateStateAndLed(const DateTime &nowLocal, unsigned long nowMs) {
     return;
   }
 
-  const bool summer = isSummerTimeEU(nowLocal);
   const DayType dayType = determineDayType(nowLocal);
   const bool allowed = isAllowedNow(nowLocal, summer, dayType);
   const int32_t secToEnd = secondsToEndOfCurrentAllowedInterval(nowLocal, summer, dayType);
@@ -436,22 +547,7 @@ void updateStateAndLed(const DateTime &nowLocal, unsigned long nowMs) {
   if (nowLocal.second() != lastDebugSecond) {
     lastDebugSecond = nowLocal.second();
     const bool holiday = isHolidayNRW(nowLocal.year(), nowLocal.month(), nowLocal.day());
-    Serial.print(nowLocal.year());
-    Serial.print('-');
-    if (nowLocal.month() < 10) Serial.print('0');
-    Serial.print(nowLocal.month());
-    Serial.print('-');
-    if (nowLocal.day() < 10) Serial.print('0');
-    Serial.print(nowLocal.day());
-    Serial.print(' ');
-    if (nowLocal.hour() < 10) Serial.print('0');
-    Serial.print(nowLocal.hour());
-    Serial.print(':');
-    if (nowLocal.minute() < 10) Serial.print('0');
-    Serial.print(nowLocal.minute());
-    Serial.print(':');
-    if (nowLocal.second() < 10) Serial.print('0');
-    Serial.print(nowLocal.second());
+    printDateTime(nowLocal);
     Serial.print(" holiday=");
     Serial.print(holiday ? "1" : "0");
     Serial.print(" summer=");
@@ -491,11 +587,28 @@ void setup() {
   rtcAvailable = true;
 
 #if SET_RTC_ON_UPLOAD
-  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-  rtcTimeValidated = true;
+  const DateTime compileLocalTime(F(__DATE__), F(__TIME__));
+  DateTime compileUtcTime;
+  const LocalToUtcStatus compileStatus = convertGermanyLocalToUtc(compileLocalTime, compileUtcTime);
+  if (compileStatus == LOCAL_TO_UTC_OK) {
+    rtc.adjust(compileUtcTime);
+    rtcTimeValidated = true;
 #if ENABLE_SERIAL_DEBUG
-  Serial.println(F("RTC adjusted to compile time."));
+    Serial.print(F("RTC adjusted from local compile time "));
+    printDateTime(compileLocalTime);
+    Serial.print(F(" to UTC "));
+    printDateTime(compileUtcTime);
+    Serial.println();
 #endif
+  } else {
+    rtcInvalidLatched = true;
+    rtcTimeValidated = false;
+    currentState = LED_ERROR_RTC_INVALID;
+#if ENABLE_SERIAL_DEBUG
+    Serial.println(F("ERROR: compile time could not be converted to UTC"));
+#endif
+    return;
+  }
 #endif
 
   if (rtc.lostPower()) {
@@ -554,6 +667,8 @@ void loop() {
     return;
   }
 
-  const DateTime nowLocal = rtc.now();
-  updateStateAndLed(nowLocal, nowMs);
+  const DateTime nowUtc = rtc.now();
+  bool summer = false;
+  const DateTime nowLocal = convertUtcToGermanyLocal(nowUtc, summer);
+  updateStateAndLed(nowLocal, summer, nowMs);
 }
