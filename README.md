@@ -26,6 +26,11 @@ Die LED zeigt anhand von Uhrzeit, Sommerzeit, Wochenenden und NRW-Feiertagen an,
 
 Die RTC wird intern in UTC betrieben. Der Sketch rechnet daraus automatisch die deutsche Lokalzeit und schaltet Sommer- und Winterzeit nach EU-Regel selbst um.
 
+Wichtig beim Umstieg:
+
+- Aeltere Firmware-Versionen haben die RTC direkt in deutscher Lokalzeit gespeichert.
+- Nach dem Flashen dieser Version sollte die RTC deshalb einmal neu gesetzt werden.
+
 Erlaubte Zeitfenster:
 
 - Sommer, Werktag: `05:30-13:00` und `15:00-23:00`
